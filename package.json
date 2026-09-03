@@ -1,0 +1,39 @@
+{
+  "name": "local-llm-workflow",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ollama で動くワークフロー型ローカルLLMアプリ。RAG・文脈の自動圧縮・管理画面・処理の3D可視化つき。TypeScript のみ。",
+  "license": "MIT",
+  "keywords": [
+    "ollama",
+    "local-llm",
+    "rag",
+    "lancedb",
+    "nextjs",
+    "typescript",
+    "babylonjs"
+  ],
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint"
+  },
+  "dependencies": {
+    "@babylonjs/core": "^9.23.0",
+    "@lancedb/lancedb": "^0.38.0",
+    "next": "16.3.4",
+    "react": "19.2.8",
+    "react-dom": "19.2.8"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^24",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.4",
+    "tailwindcss": "^4",
+    "typescript": "^5"
+  }
+}
