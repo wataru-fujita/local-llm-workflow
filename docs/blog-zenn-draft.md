@@ -597,6 +597,6 @@ Ray needs to be imported before as it contains a side-effect required by your co
 
 分からないなりに、対話しながら設計を言語化し、動かして確かめ、分かったことを設計へ戻す。この進め方自体が、想像していたよりも速く進みました。
 
-リポジトリ: `https://github.com/<user>/local-llm-workflow`（MIT）
+リポジトリ: https://github.com/wataru-fujita/local-llm-workflow （MIT）
 
 同じスペック帯で試す方の時間が、少しでも減れば幸いです。
