@@ -1,10 +1,10 @@
-import { chat, type ChatMessage } from "@/lib/ollama";
+import { chat, PROMPT_BUDGET_TOKENS, type ChatMessage } from "@/lib/ollama";
 import { embed } from "@/lib/embeddings";
 import {
   addMessage,
   approxTokenCount,
+  buildPrompt,
   getConversation,
-  getPromptMessages,
   maybeCompact,
   statsFor,
 } from "@/lib/conversation";
@@ -127,30 +127,36 @@ export async function POST(request: Request) {
           });
         }
 
-        // 3. assemble the prompt.
-        const messages = await step("prompt", "プロンプトを構成", async () => {
-          const history = await getPromptMessages();
-          const msgs: ChatMessage[] = [
-            ...(retrieved.length
-              ? [
-                  {
-                    role: "system" as const,
-                    content:
-                      "次の参考情報を必要に応じて回答に使ってください。関係なければ無視してください。\n" +
-                      retrieved.map((r, i) => `[${i + 1}] ${r.text}`).join("\n"),
-                  },
-                ]
-              : []),
-            ...history,
-            { role: "user", content: message },
-          ];
-          return msgs;
-        });
+        // 3. assemble the prompt, fitted to the context budget *before*
+        //    generating. Whatever is left of the window is the answer's alone.
+        const prefix: ChatMessage[] = retrieved.length
+          ? [
+              {
+                role: "system",
+                content:
+                  "次の参考情報を必要に応じて回答に使ってください。関係なければ無視してください。\n" +
+                  retrieved.map((r, i) => `[${i + 1}] ${r.text}`).join("\n"),
+              },
+            ]
+          : [];
+
+        const built = await step("prompt", "プロンプトを構成", () =>
+          buildPrompt({ userMessage: message, prefix }),
+        );
+        const messages = built.messages;
         send({
           type: "stage",
           stage: "prompt",
           status: "end",
-          detail: `${messages.length} メッセージ`,
+          detail: [
+            `${messages.length} メッセージ`,
+            `約 ${built.estimatedTokens}/${built.budgetTokens} tokens`,
+            ...(built.compaction ? ["生成前に圧縮"] : []),
+            ...(built.droppedMessages
+              ? [`古い ${built.droppedMessages} 件を除外`]
+              : []),
+            ...(built.droppedPrefix ? ["参考情報を除外"] : []),
+          ].join(" · "),
         });
 
         // 4. generate.
@@ -159,7 +165,8 @@ export async function POST(request: Request) {
           send({
             type: "error",
             error:
-              "モデルが空の応答を返しました。`.env.local` の OLLAMA_CHAT_THINK や num_ctx を見直してください。",
+              "モデルが空の応答を返しました。`.env.local` の OLLAMA_CHAT_THINK と " +
+              "OLLAMA_CHAT_MAX_OUTPUT_TOKENS を見直してください。",
           });
           controller.close();
           return;
@@ -168,9 +175,13 @@ export async function POST(request: Request) {
           type: "stage",
           stage: "generate",
           status: "end",
-          detail: `${result.evalCount} tokens${
-            result.tokensPerSecond ? ` · ${result.tokensPerSecond} tok/s` : ""
-          }`,
+          detail:
+            `${result.evalCount} tokens` +
+            (result.tokensPerSecond ? ` · ${result.tokensPerSecond} tok/s` : "") +
+            (result.promptEvalCount
+              ? ` · 入力 ${result.promptEvalCount} tokens`
+              : "") +
+            (result.truncated ? " · 出力上限で打ち切り" : ""),
         });
 
         // 5. persist the turn.
@@ -205,6 +216,12 @@ export async function POST(request: Request) {
           totalDurationMs: result.totalDurationMs,
           evalCount: result.evalCount,
           tokensPerSecond: result.tokensPerSecond,
+          promptEvalCount: result.promptEvalCount,
+          promptBudgetTokens: PROMPT_BUDGET_TOKENS,
+          // The prompt is fitted before generating now, so this means "the
+          // answer really was longer than the output reserve" - not "the
+          // prompt ate the window", which is what it used to mean silently.
+          truncated: result.truncated,
           stats,
           compaction: compaction
             ? {

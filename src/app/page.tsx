@@ -26,6 +26,9 @@ type ReplyMeta = {
   totalDurationMs: number;
   evalCount: number;
   tokensPerSecond: number | null;
+  /** Real prompt size from the model's tokeniser, vs the budget it had to fit. */
+  promptEvalCount: number;
+  promptBudgetTokens: number;
   retrieved: { text: string; distance: number }[];
 };
 type KnowledgeItem = { text: string; source: string; createdAt: string };
@@ -230,15 +233,18 @@ export default function Home() {
               totalDurationMs: ev.totalDurationMs as number,
               evalCount: ev.evalCount as number,
               tokensPerSecond: ev.tokensPerSecond as number | null,
+              promptEvalCount: (ev.promptEvalCount as number) ?? 0,
+              promptBudgetTokens: (ev.promptBudgetTokens as number) ?? 0,
               retrieved:
                 (ev.retrieved as { text: string; distance: number }[]) ?? [],
             });
+            const notices: string[] = [];
             const comp = ev.compaction as {
               summarizedMessages: number;
               factsSaved: string[];
             } | null;
             if (comp) {
-              setNotice(
+              notices.push(
                 `古い履歴 ${comp.summarizedMessages} 件を要約に圧縮しました` +
                   (comp.factsSaved.length
                     ? `（長期知識へ ${comp.factsSaved.length} 件移送）`
@@ -247,6 +253,16 @@ export default function Home() {
               refreshConversationMeta();
               refreshKnowledge();
             }
+            // The prompt is fitted to the budget before generating, so this can
+            // only mean the answer itself ran past the output reserve. Say so
+            // instead of leaving the user with a sentence that stops mid-word.
+            if (ev.truncated) {
+              notices.push(
+                `回答が出力上限 (${ev.evalCount} tokens) に達して途中で終わりました。` +
+                  "「続けて」と送ると続きを生成できます。",
+              );
+            }
+            setNotice(notices.join(" / "));
           } else if (ev.type === "error") {
             finished = true;
             setError((ev.error as string) ?? "エラーが発生しました。");
@@ -510,6 +526,10 @@ export default function Home() {
                   ? ` · ${lastMeta.tokensPerSecond} tok/s`
                   : ""
               } · ${(lastMeta.totalDurationMs / 1000).toFixed(1)}s${
+                lastMeta.promptEvalCount && lastMeta.promptBudgetTokens
+                  ? ` · 入力 ${lastMeta.promptEvalCount}/${lastMeta.promptBudgetTokens} tokens`
+                  : ""
+              }${
                 lastMeta.retrieved.length
                   ? ` · 参照知識 ${lastMeta.retrieved.length}件`
                   : ""

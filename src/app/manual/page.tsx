@@ -24,8 +24,11 @@ export default function ManualPage() {
     ["要約モデル", ollamaConfig.summaryModel],
     ["埋め込みモデル", embedConfig.model],
     ["文脈長 (num_ctx)", String(ollamaConfig.chatNumCtx)],
+    ["出力の予約枠", `${ollamaConfig.chatMaxOutputTokens} tokens`],
+    ["プロンプト予算", `${ollamaConfig.promptBudgetTokens} tokens`],
     ["思考モード", ollamaConfig.chatThink ? "ON" : "OFF"],
-    ["圧縮しきい値", `${conversationConfig.triggerTokens} tokens（概算）`],
+    ["圧縮しきい値", `${conversationConfig.triggerTokens} tokens（履歴＋要約）`],
+    ["要約の上限", `${conversationConfig.maxSummaryTokens} tokens`],
     ["圧縮後に残すターン", String(conversationConfig.keepRecentTurns)],
     ["プロンプトの履歴上限", `${MAX_MESSAGES_IN_PROMPT} 件`],
     ["RAG しきい値", `距離 ${knowledgeConfig.maxDistance} 以内`],
@@ -159,9 +162,17 @@ export default function ManualPage() {
       </Section>
 
       <Section title="文脈の自動圧縮">
-        <p>毎回の返信後にチェックし、どちらかを超えたら圧縮します。</p>
+        <p>
+          <strong>生成の前に</strong>プロンプトを予算（
+          {ollamaConfig.promptBudgetTokens} tokens）へ収めます。収まらないときは
+          「古いターンを要約 → 古い発言を除外 → 要約を圧縮 → 参考情報を除外」の順に
+          削ります。返信後にもチェックし、どちらかを超えていれば圧縮します。
+        </p>
         <ul>
-          <li>生ログの概算トークン数が {conversationConfig.triggerTokens} を超えた</li>
+          <li>
+            履歴<strong>と要約の合計</strong>が {conversationConfig.triggerTokens}{" "}
+            tokens を超えた
+          </li>
           <li>
             メッセージ数が {conversationConfig.keepRecentTurns * 2 + 4} 件を超えた
           </li>
@@ -209,8 +220,15 @@ export default function ManualPage() {
       <Section title="触らないほうが安全な設定">
         <Note tone="warn">
           <p>
-            <Code>OLLAMA_CHAT_NUM_CTX={ollamaConfig.chatNumCtx}</Code> — 既定の 16384
-            だと VRAM から溢れて CPU に 12% 落ち、22 tok/s が 13 tok/s まで下がります。
+            <Code>OLLAMA_CHAT_NUM_CTX={ollamaConfig.chatNumCtx}</Code> —
+            <strong>実測で決めた値です。変えるなら測り直してください。</strong>
+            qwen3.5 は 32 層中 8 層しか attention を持たないハイブリッド構成なので
+            KV キャッシュが小さく、4096〜15360 はどれも 34/34 層が GPU に載ります。
+            速度は単調ではなく、同じ全層 GPU でも 8192 が 16.7 tok/s、12288 以上が
+            31.2 tok/s です。さらに<strong>埋め込みモデルと同居させた状態</strong>で
+            測ると、chat＋embed の合計 6.47GB と 6.50GB の間に無警告の崖があり、
+            14336 以上では decode が 55% 落ちます。12288 はその手前でマージンを
+            取った値です。
           </p>
           <p className="mt-2">
             <Code>OLLAMA_CHAT_THINK=false</Code> — qwen3.5 は思考モデルなので、有効だと

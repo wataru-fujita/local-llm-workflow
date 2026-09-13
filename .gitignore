@@ -46,3 +46,7 @@ next-env.d.ts
 
 # personal working log - not distributed
 /docs/handoff.md
+
+# stdout/stderr of a locally started `next start`
+/server-3000.log
+/server-3000.err.log

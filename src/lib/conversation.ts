@@ -18,8 +18,9 @@
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import type { ChatMessage, ChatRole } from "./ollama";
-import { summaryComplete } from "./ollama";
+import { PROMPT_BUDGET_TOKENS, summaryComplete } from "./ollama";
 import { addKnowledge } from "./knowledge";
+import { estimateMessageTokens, estimateTokens } from "./tokens";
 
 const DATA_DIR = path.join(process.cwd(), "data");
 const STORE_PATH = path.join(DATA_DIR, "conversation.json");
@@ -27,6 +28,15 @@ const STORE_PATH = path.join(DATA_DIR, "conversation.json");
 /** Compression thresholds (env-tunable). */
 const TRIGGER_TOKENS = Number(process.env.CONVO_COMPRESS_TRIGGER_TOKENS ?? 1400);
 const KEEP_RECENT_TURNS = Number(process.env.CONVO_KEEP_RECENT_TURNS ?? 4);
+/**
+ * Ceiling on the rolling summary itself. Without one it grew every compaction
+ * (10 compactions had produced a 3424-character summary - larger than half the
+ * whole context window) while `maybeCompact` did not count it at all, so each
+ * compaction made the real prompt bigger rather than smaller.
+ */
+const MAX_SUMMARY_TOKENS = Number(
+  process.env.CONVO_MAX_SUMMARY_TOKENS ?? Math.floor(PROMPT_BUDGET_TOKENS * 0.3),
+);
 /** Hard ceiling on verbatim messages sent, regardless of compression. */
 export const MAX_MESSAGES_IN_PROMPT = 24;
 /** Cap on auto-extracted facts saved per compression. */
@@ -58,9 +68,18 @@ export type CompactionResult = {
   summary: string;
 };
 
-/** Very rough token estimate (mixed CJK/latin). Good enough for a trigger gauge. */
+/**
+ * Token estimate for one string. Delegates to the script-aware, self-calibrating
+ * estimator; the old `length / 3` here under-counted Japanese by ~1.7x, which is
+ * what let the prompt overflow the context window unnoticed.
+ */
 export function approxTokenCount(text: string): number {
-  return Math.ceil(text.length / 3);
+  return estimateTokens(text);
+}
+
+/** Tokens the rolling summary costs when sent, or 0 when there is none. */
+function summaryTokens(state: ConversationState): number {
+  return state.summary ? estimateTokens(state.summary) : 0;
 }
 
 function emptyState(): ConversationState {
@@ -115,22 +134,10 @@ export async function getConversation(): Promise<ConversationState> {
   return store.state;
 }
 
-/**
- * Messages to send to the model: the rolling summary (as a system message, if
- * any) followed by the trailing verbatim history.
- */
-export async function getPromptMessages(): Promise<ChatMessage[]> {
-  await ensureLoaded();
-  const recent = store.state.messages.slice(-MAX_MESSAGES_IN_PROMPT);
-  if (!store.state.summary) return recent;
-  return [
-    {
-      role: "system",
-      content: `これまでの会話の要約:\n${store.state.summary}`,
-    },
-    ...recent,
-  ];
-}
+// `getPromptMessages()` used to live here: summary + trailing history, with no
+// notion of a token budget. That is exactly how the prompt came to overflow the
+// context window unnoticed, so it has been replaced by `buildPrompt()` below,
+// which fits the prompt to the budget before the model ever sees it.
 
 /** Append one message and persist. */
 export async function addMessage(role: ChatRole, content: string): Promise<void> {
@@ -239,7 +246,7 @@ export async function compactConversation(
     factsSaved = [];
   }
 
-  s.summary = newSummary || s.summary;
+  s.summary = await capSummary(newSummary || s.summary);
   s.messages = recent;
   s.compactions += 1;
   await persist();
@@ -252,21 +259,157 @@ export async function compactConversation(
   };
 }
 
-/** Run compression only if the verbatim history is over the token/turn budget. */
+/**
+ * Re-summarise the rolling summary when it outgrows its ceiling, so it cannot
+ * creep up on the context budget compaction after compaction.
+ */
+async function capSummary(summary: string): Promise<string> {
+  return capSummaryTo(summary, MAX_SUMMARY_TOKENS);
+}
+
+/**
+ * Run compression when what we would actually *send* is over budget.
+ *
+ * The old version summed only `state.messages`, ignoring the rolling summary
+ * that every prompt always carries. Since the summary grew with every
+ * compaction, compaction reported progress while the real prompt kept growing.
+ */
 export async function maybeCompact(): Promise<CompactionResult | null> {
   await ensureLoaded();
   const s = store.state;
-  const tokens = s.messages.reduce(
-    (n, m) => n + approxTokenCount(m.content),
-    0,
-  );
+  const tokens =
+    s.messages.reduce((n, m) => n + approxTokenCount(m.content), 0) +
+    summaryTokens(s);
   const overTokens = tokens > TRIGGER_TOKENS;
   const overCount = s.messages.length > KEEP_RECENT_TURNS * 2 + 4;
   if (!overTokens && !overCount) return null;
   return compactConversation(false);
 }
 
+export type PromptBuild = {
+  messages: ChatMessage[];
+  /** Estimated size of `messages`, already inside the budget. */
+  estimatedTokens: number;
+  budgetTokens: number;
+  /** Verbatim messages dropped to make it fit. */
+  droppedMessages: number;
+  /** Reference entries dropped to make it fit. */
+  droppedPrefix: number;
+  /** Compaction run *before* generating, if one was needed. */
+  compaction: CompactionResult | null;
+};
+
+/**
+ * Assemble the prompt so that it provably fits the budget *before* generating.
+ *
+ * This is the fix for answers being cut off: previously the prompt was built
+ * blind, compaction ran only *after* the reply, and Ollama silently trimmed the
+ * overflow off the front of the prompt while the answer competed with the
+ * prompt for the same window. Now the prompt is fitted first, and whatever is
+ * left of the window belongs to the answer alone.
+ *
+ * Order of sacrifice, least to most costly: compact old turns -> drop the
+ * oldest verbatim turns -> shrink the summary -> drop the weakest RAG hits.
+ */
+export async function buildPrompt(opts: {
+  userMessage: string;
+  /** Reference material (RAG), most relevant first. */
+  prefix?: ChatMessage[];
+  budgetTokens?: number;
+}): Promise<PromptBuild> {
+  await ensureLoaded();
+  const budget = opts.budgetTokens ?? PROMPT_BUDGET_TOKENS;
+  let prefix = [...(opts.prefix ?? [])];
+  let compaction: CompactionResult | null = null;
+  let droppedMessages = 0;
+
+  const userMsg: ChatMessage = { role: "user", content: opts.userMessage };
+
+  const assemble = (history: ChatMessage[]): ChatMessage[] => [
+    ...prefix,
+    ...(store.state.summary
+      ? [
+          {
+            role: "system" as const,
+            content: `これまでの会話の要約:\n${store.state.summary}`,
+          },
+        ]
+      : []),
+    ...history,
+    userMsg,
+  ];
+
+  let history = store.state.messages.slice(-MAX_MESSAGES_IN_PROMPT);
+  let messages = assemble(history);
+
+  // 1. Over budget? Fold the old turns into the summary first - that is what
+  //    compaction is for, and it keeps the information rather than dropping it.
+  if (estimateMessageTokens(messages) > budget) {
+    compaction = await compactConversation(false);
+    if (compaction) {
+      history = store.state.messages.slice(-MAX_MESSAGES_IN_PROMPT);
+      messages = assemble(history);
+    }
+  }
+
+  // 2. Still over? Drop the oldest verbatim messages, always keeping the last
+  //    exchange so the model can at least follow the immediate thread.
+  while (estimateMessageTokens(messages) > budget && history.length > 2) {
+    history = history.slice(1);
+    droppedMessages++;
+    messages = assemble(history);
+  }
+
+  // 3. Still over? The summary is now the biggest movable block.
+  if (estimateMessageTokens(messages) > budget && store.state.summary) {
+    const withoutSummary = [...prefix, ...history, userMsg];
+    const room = Math.max(120, budget - estimateMessageTokens(withoutSummary));
+    const shrunk = await capSummaryTo(store.state.summary, room);
+    if (shrunk !== store.state.summary) {
+      store.state.summary = shrunk;
+      await persist();
+      messages = assemble(history);
+    }
+  }
+
+  // 4. Still over? Give up reference material, weakest first.
+  let droppedPrefix = 0;
+  while (estimateMessageTokens(messages) > budget && prefix.length > 0) {
+    prefix = prefix.slice(0, -1);
+    droppedPrefix++;
+    messages = assemble(history);
+  }
+
+  return {
+    messages,
+    estimatedTokens: estimateMessageTokens(messages),
+    budgetTokens: budget,
+    droppedMessages,
+    droppedPrefix,
+    compaction,
+  };
+}
+
+/** Shrink a summary to roughly `targetTokens`, preferring a real re-summary. */
+async function capSummaryTo(summary: string, targetTokens: number): Promise<string> {
+  if (!summary || estimateTokens(summary) <= targetTokens) return summary;
+  try {
+    const tighter = await summaryComplete(
+      "次の要約を、重要な事実・決定・未解決事項を落とさずに日本語で凝縮してください。\n" +
+        `全体で日本語 ${Math.max(80, Math.floor(targetTokens * 1.5))} 文字以内。箇条書き可。\n\n` +
+        summary,
+    );
+    if (tighter && estimateTokens(tighter) <= targetTokens) return tighter;
+  } catch {
+    /* fall through */
+  }
+  const keepChars = Math.max(150, Math.floor(targetTokens * 1.5));
+  return `（前略）${summary.slice(-keepChars)}`;
+}
+
 export const conversationConfig = {
   triggerTokens: TRIGGER_TOKENS,
   keepRecentTurns: KEEP_RECENT_TURNS,
+  maxSummaryTokens: MAX_SUMMARY_TOKENS,
+  promptBudgetTokens: PROMPT_BUDGET_TOKENS,
 } as const;
